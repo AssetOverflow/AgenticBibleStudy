@@ -1,19 +1,23 @@
 import json
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+
+# Removed dataclasses and Parquet loading logic to separate modules
+from .models import Bible, Book, Chapter, Verse
+from .parquet_loader import load_bible_from_parquet
+from .utils import ensure_pyarrow_available
 
 # Optional PyArrow import with graceful fallback
 try:
     import pyarrow as pa
     import pyarrow.parquet as pq
+    from pyarrow import Table
 
     PYARROW_AVAILABLE = True
 except ImportError:
     PYARROW_AVAILABLE = False
-    pa = None
-    pq = None
 
 # -----------------------------------------------------------
 # 1. Canonical reference data
@@ -1562,159 +1566,6 @@ def validate_verse_count_flexible(book: str, chapter: int, actual_count: int) ->
     return actual_count in variations
 
 
-@dataclass
-class BibleProcessor:
-    json_path: Path
-    translation_name: str = field(init=False)
-    raw_data: Dict[str, Any] = field(init=False)
-    validated: bool = field(default=False)
-    issues: List[str] = field(default_factory=list)
-
-    def __post_init__(self):
-        self.translation_name = self.json_path.stem.replace("clean_", "")
-        self.raw_data = self._load_json()
-
-    def _load_json(self) -> Dict[str, Any]:
-        """Load JSON data from file with error handling"""
-        try:
-            return json.loads(self.json_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            raise FileNotFoundError(f"JSON file not found: {self.json_path}")
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in {self.json_path}: {e}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load JSON from {self.json_path}: {e}")
-
-    def validate_structure(self) -> List[str]:
-        """Validate JSON structure against canonical requirements"""
-        issues: List[str] = []
-
-        # Collect all books from both testaments using modern dict unpacking
-        books = {}
-        for testament in ["old_testament", "new_testament"]:
-            if testament in self.raw_data:
-                books |= self.raw_data[testament].get("books", {})
-
-        # Check book completeness using set operations
-        canonical_set = set(CANONICAL_BOOKS)
-        books_set = set(books.keys())
-
-        if missing := canonical_set - books_set:
-            issues.append(f"Missing books: {', '.join(sorted(missing))}")
-        if extra := books_set - canonical_set:
-            issues.append(f"Extra books: {', '.join(sorted(extra))}")
-
-        # Check chapter/verse counts using pattern matching for better structure
-        for book_name, book_data in books.items():
-            match book_name:
-                case name if name not in EXPECTED_VERSES:
-                    issues.append(f"Skipping {book_name} - no verse data")
-                    continue
-                case _:
-                    pass
-
-            chapters = book_data.get("chapters", {})
-            expected_chapters = EXPECTED_VERSES[book_name]
-
-            # Chapter count check
-            if len(chapters) != len(expected_chapters):
-                issues.append(
-                    f"{book_name}: Expected {len(expected_chapters)} chapters, "
-                    f"found {len(chapters)}"
-                )
-
-            # Verse count per chapter using walrus operator and match
-            for ch_num, expected_verse_count in expected_chapters.items():
-                match chapters.get(str(ch_num)):
-                    case None:
-                        issues.append(f"{book_name} {ch_num}: Missing chapter")
-                        continue
-                    case chapter:
-                        verses = chapter.get("verses", {})
-                        # Count non-None verses efficiently
-                        actual_verse_count = sum(
-                            1 for v in verses.values() if v is not None
-                        )
-
-                        if not validate_verse_count_flexible(
-                            book_name, ch_num, actual_verse_count
-                        ):
-                            issues.append(
-                                f"{book_name} {ch_num}: Expected {expected_verse_count} verses, "
-                                f"found {actual_verse_count}"
-                            )
-
-        self.issues = issues
-        self.validated = not bool(issues)
-        return issues
-
-    def convert_to_parquet(self, output_dir: Path) -> Path:
-        """Convert validated JSON to Parquet format"""
-        if not PYARROW_AVAILABLE:
-            raise ImportError(
-                "PyArrow is required for Parquet conversion. "
-                "Install with: pip install pyarrow"
-            )
-
-        if not self.validated:
-            raise ValueError("JSON structure not validated or validation failed")
-
-        # Create output directory if needed
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{self.translation_name}.parquet"
-
-        # Prepare data using generator for memory efficiency
-        def generate_verse_data():
-            """Generator that yields verse data dictionaries efficiently"""
-            testament_mapping = {"old_testament": "old", "new_testament": "new"}
-
-            for testament, books in (
-                (t, self.raw_data[t]["books"])
-                for t in ["old_testament", "new_testament"]
-                if t in self.raw_data
-            ):
-                testament_short = testament_mapping[testament]
-
-                for book_name, book_data in books.items():
-                    chapters = book_data.get("chapters", {})
-
-                    for ch_num, chapter in chapters.items():
-                        verses = chapter.get("verses", {})
-
-                        for v_num, verse_data in verses.items():
-                            # Skip None verses
-                            if verse_data is None:
-                                continue
-
-                            yield {
-                                "translation": self.translation_name,
-                                "testament": testament_short,
-                                "book": book_name,
-                                "chapter": int(ch_num),
-                                "verse": int(v_num),
-                                "text": verse_data.get("text", ""),
-                                "id": verse_data.get("id", ""),
-                                "strongs_numbers": verse_data.get(
-                                    "strongs_numbers", []
-                                ),
-                                "cross_references": verse_data.get(
-                                    "cross_references", []
-                                ),
-                            }
-
-        # Create PyArrow Table and save as Parquet
-        data = list(generate_verse_data())
-
-        if not data:
-            raise ValueError("No verse data found to convert to Parquet")
-
-        table = pa.Table.from_pylist(data)
-        pq.write_table(table, output_path)
-
-        print(f"✅ Converted {len(data)} verses to {output_path}")
-        return output_path
-
-
 def process_translation(json_path: Path, output_dir: Path) -> Dict[str, Any]:
     """Process a single translation file"""
     translation_name = json_path.stem.replace("clean_", "")
@@ -1871,6 +1722,192 @@ def main():
 
     print(f"\n📁 Parquet files saved to: {output_dir}")
     print("🎉 Processing complete!")
+
+
+# Reintroduce the BibleProcessor class
+@dataclass
+class BibleProcessor:
+    json_path: Path
+    translation_name: str = field(init=False)
+    raw_data: Dict[str, Any] = field(init=False)
+    validated: bool = field(default=False)
+    issues: List[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.translation_name = self.json_path.stem.replace("clean_", "")
+        self.raw_data = self._load_json()
+
+    def _load_json(self) -> Dict[str, Any]:
+        """Load JSON data from file with error handling"""
+        try:
+            return json.loads(self.json_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise FileNotFoundError(f"JSON file not found: {self.json_path}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in {self.json_path}: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load JSON from {self.json_path}: {e}")
+
+    def validate_structure(self) -> List[str]:
+        """Validate JSON structure against canonical requirements"""
+        issues: List[str] = []
+
+        # Collect all books from both testaments using modern dict unpacking
+        books = {}
+        for testament in ["old_testament", "new_testament"]:
+            if testament in self.raw_data:
+                books |= self.raw_data[testament].get("books", {})
+
+        # Check book completeness using set operations
+        canonical_set = set(CANONICAL_BOOKS)
+        books_set = set(books.keys())
+
+        if missing := canonical_set - books_set:
+            issues.append(f"Missing books: {', '.join(sorted(missing))}")
+        if extra := books_set - canonical_set:
+            issues.append(f"Extra books: {', '.join(sorted(extra))}")
+
+        # Check chapter/verse counts using pattern matching for better structure
+        for book_name, book_data in books.items():
+            match book_name:
+                case name if name not in EXPECTED_VERSES:
+                    issues.append(f"Skipping {book_name} - no verse data")
+                    continue
+                case _:
+                    pass
+
+            chapters = book_data.get("chapters", {})
+            expected_chapters = EXPECTED_VERSES[book_name]
+
+            # Chapter count check
+            if len(chapters) != len(expected_chapters):
+                issues.append(
+                    f"{book_name}: Expected {len(expected_chapters)} chapters, "
+                    f"found {len(chapters)}"
+                )
+
+            # Verse count per chapter using walrus operator and match
+            for ch_num, expected_verse_count in expected_chapters.items():
+                match chapters.get(str(ch_num)):
+                    case None:
+                        issues.append(f"{book_name} {ch_num}: Missing chapter")
+                        continue
+                    case chapter:
+                        verses = chapter.get("verses", {})
+                        # Count non-None verses efficiently
+                        actual_verse_count = sum(
+                            1 for v in verses.values() if v is not None
+                        )
+
+                        if not validate_verse_count_flexible(
+                            book_name, ch_num, actual_verse_count
+                        ):
+                            issues.append(
+                                f"{book_name} {ch_num}: Expected {expected_verse_count} verses, "
+                                f"found {actual_verse_count}"
+                            )
+
+        self.issues = issues
+        self.validated = not bool(issues)
+        return issues
+
+    def convert_to_parquet(self, output_dir: Path) -> Path:
+        """Convert validated JSON to Parquet format"""
+        if not PYARROW_AVAILABLE:
+            raise ImportError(
+                "PyArrow is required for Parquet conversion. "
+                "Install with: pip install pyarrow"
+            )
+
+        if not self.validated:
+            raise ValueError("JSON structure not validated or validation failed")
+
+        # Create output directory if needed
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{self.translation_name}.parquet"
+
+        # Prepare data using generator for memory efficiency
+        def generate_verse_data():
+            """Generator that yields verse data dictionaries efficiently"""
+            testament_mapping = {"old_testament": "old", "new_testament": "new"}
+
+            for testament, books in (
+                (t, self.raw_data[t]["books"])
+                for t in ["old_testament", "new_testament"]
+                if t in self.raw_data
+            ):
+                testament_short = testament_mapping[testament]
+
+                for book_name, book_data in books.items():
+                    chapters = book_data.get("chapters", {})
+
+                    for ch_num, chapter in chapters.items():
+                        verses = chapter.get("verses", {})
+
+                        for v_num, verse_data in verses.items():
+                            # Skip None verses
+                            if verse_data is None:
+                                continue
+
+                            yield {
+                                "translation": self.translation_name,
+                                "testament": testament_short,
+                                "book": book_name,
+                                "chapter": int(ch_num),
+                                "verse": int(v_num),
+                                "text": verse_data.get("text", ""),
+                                "id": verse_data.get("id", ""),
+                                "strongs_numbers": verse_data.get(
+                                    "strongs_numbers", []
+                                ),
+                                "cross_references": verse_data.get(
+                                    "cross_references", []
+                                ),
+                            }
+
+        # Create PyArrow Table and save as Parquet
+        data = list(generate_verse_data())
+
+        if not data:
+            raise ValueError("No verse data found to convert to Parquet")
+
+        table = pa.Table.from_pylist(data)
+        pq.write_table(table, output_path)
+
+        print(f"✅ Converted {len(data)} verses to {output_path}")
+        return output_path
+
+
+# Function to read and query Parquet files for Bible translations
+def read_parquet_bible(file_path: str, book: Optional[str] = None, chapter: Optional[int] = None, verse: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Reads a Parquet file containing Bible translations and allows querying by book, chapter, and verse.
+
+    Args:
+        file_path (str): Path to the Parquet file.
+        book (Optional[str]): Name of the book to filter by.
+        chapter (Optional[int]): Chapter number to filter by.
+        verse (Optional[int]): Verse number to filter by.
+
+    Returns:
+        List[Dict[str, Any]]: A list of matching records.
+    """
+    ensure_pyarrow_available()
+
+    # Read the Parquet file
+    table: Table = pq.read_table(file_path)
+    df = table.to_pandas()
+
+    # Apply filters if provided
+    if book:
+        df = df[df['book'] == book]
+    if chapter:
+        df = df[df['chapter'] == chapter]
+    if verse:
+        df = df[df['verse'] == verse]
+
+    # Convert the filtered DataFrame to a list of dictionaries
+    return df.to_dict(orient='records')
 
 
 if __name__ == "__main__":
